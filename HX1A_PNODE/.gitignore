@@ -1,4 +1,13 @@
-# Dependencies
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+*.egg
+
+# Node
 node_modules/
 
 # Environment
