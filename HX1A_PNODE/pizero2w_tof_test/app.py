@@ -45,12 +45,12 @@ class ToFCamera:
 
 
 class VL53L5CXCamera(ToFCamera):
-    """Real Arducam VL53L5CX ToF camera via I2C."""
+    """Real Arducam VL53L5CX ToF camera via I2C (Pimoroni vl53l5cx-ctypes)."""
 
     def __init__(self):
         try:
-            from vl53l5cx import VL53L5CX
-            self.dev = VL53L5CX()
+            import vl53l5cx
+            self.dev = vl53l5cx.vl53l5cx()
             self.dev.start_ranging()
             self.running = True
             log.info("VL53L5CX ToF camera initialized")
@@ -60,6 +60,8 @@ class VL53L5CXCamera(ToFCamera):
 
     def capture_depth(self) -> np.ndarray | None:
         try:
+            if not self.dev.data_ready():
+                return None
             data = self.dev.get_data()
             dist = data.distance_mm  # 1D array, 64*48 = 3072
             frame = np.array(dist, dtype=np.uint16).reshape(self.HEIGHT, self.WIDTH)
