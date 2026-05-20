@@ -1,4 +1,7 @@
-flask>=3.0
-opencv-python-headless>=4.9
-numpy<2.0.0
+# On Raspberry Pi OS Lite, install system packages first:
+#   sudo apt install -y python3-opencv python3-numpy python3-flask
+# Then create venv with system packages:
+#   python3 -m venv --system-site-packages venv
+# Then install only the Arducam SDK:
+#   source venv/bin/activate && pip install ArducamDepthCamera
 ArducamDepthCamera
