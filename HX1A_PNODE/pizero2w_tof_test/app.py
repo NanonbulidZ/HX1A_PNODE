@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-HX1A Pi Zero 2W — Arducam ToF Camera Test
+HX1A Pi Zero 2W — Arducam CSI ToF Camera Test
 Hosts a web server that streams color-mapped depth images over HTTP.
 
 Usage:
-    python3 app.py [--mock] [--host 0.0.0.0] [--port 5000]
+    python3 app.py [--mock] [--host 0.0.0.0] [--port 5000] [--range 4000]
 
-Without --mock: attempts to read from VL53L5CX ToF sensor via I2C
+Without --mock: uses ArducamDepthCamera SDK (CSI ToF camera, 240x180)
 With --mock:    generates synthetic depth data for testing without hardware
 """
 
 import argparse
-import io
 import logging
 import time
 import threading
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -28,55 +26,66 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ───────────────────────────────────────────────────────────────────
-#  TOF SENSOR ABSTRACTION
+#  TOF CAMERA ABSTRACTION
 # ───────────────────────────────────────────────────────────────────
 
 class ToFCamera:
-    """Base interface — override _capture_raw() for your sensor."""
-
-    WIDTH = 64
-    HEIGHT = 48
-    MIN_MM = 20
+    WIDTH = 240
+    HEIGHT = 180
+    MIN_MM = 0
     MAX_MM = 4000
 
     def capture_depth(self) -> np.ndarray | None:
-        """Returns depth frame in mm (HxW uint16) or None on failure."""
         raise NotImplementedError
 
+    def close(self):
+        pass
 
-class VL53L5CXCamera(ToFCamera):
-    """Real Arducam VL53L5CX ToF camera via I2C (Pimoroni vl53l5cx-ctypes)."""
 
-    def __init__(self):
-        try:
-            import vl53l5cx
-            self.dev = vl53l5cx.vl53l5cx()
-            self.dev.start_ranging()
-            self.running = True
-            log.info("VL53L5CX ToF camera initialized")
-        except Exception as e:
-            log.error("Failed to init VL53L5CX: %s", e)
-            raise
+class ArducamToF(ToFCamera):
+    """Arducam CSI ToF camera via official SDK."""
+
+    def __init__(self, max_range_mm: int = 4000):
+        import ArducamDepthCamera as ac
+        self.ac = ac
+        self.cam = ac.ArducamCamera()
+        self.max_range = max_range_mm
+
+        ret = self.cam.open(ac.Connection.CSI, 0)
+        if ret != 0:
+            raise RuntimeError(f"Failed to open camera. Error code: {ret}")
+
+        ret = self.cam.start(ac.FrameType.DEPTH)
+        if ret != 0:
+            self.cam.close()
+            raise RuntimeError(f"Failed to start camera. Error code: {ret}")
+
+        self.cam.setControl(ac.Control.RANGE, max_range_mm)
+        info = self.cam.getCameraInfo()
+        self.WIDTH = info.width
+        self.HEIGHT = info.height
+
+        log.info("Arducam ToF camera initialized — %dx%d, range=%dmm",
+                  self.WIDTH, self.HEIGHT, max_range_mm)
 
     def capture_depth(self) -> np.ndarray | None:
         try:
-            if not self.dev.data_ready():
+            frame = self.cam.requestFrame(2000)
+            if frame is None or not isinstance(frame, self.ac.DepthData):
                 return None
-            data = self.dev.get_data()
-            dist = data.distance_mm  # 1D array, 64*48 = 3072
-            frame = np.array(dist, dtype=np.uint16).reshape(self.HEIGHT, self.WIDTH)
-            return frame
+            depth = frame.depth_data.copy()
+            self.cam.releaseFrame(frame)
+            return depth
         except Exception as e:
             log.warning("Capture failed: %s", e)
             return None
 
     def close(self):
-        if self.running:
-            try:
-                self.dev.stop_ranging()
-            except Exception:
-                pass
-            self.running = False
+        try:
+            self.cam.stop()
+            self.cam.close()
+        except Exception:
+            pass
 
 
 class MockCamera(ToFCamera):
@@ -95,28 +104,24 @@ class MockCamera(ToFCamera):
             + 150 * np.cos(y / 8 - self.t * 0.7)
             + np.random.randint(-30, 30, (self.HEIGHT, self.WIDTH), dtype=np.int16)
         )
-        depth = np.clip(depth, self.MIN_MM, self.MAX_MM).astype(np.uint16)
-        return depth
-
-    def close(self):
-        pass
+        return np.clip(depth, self.MIN_MM, self.MAX_MM).astype(np.uint16)
 
 
 # ───────────────────────────────────────────────────────────────────
 #  DEPTH → COLOR MAPPING
 # ───────────────────────────────────────────────────────────────────
 
-def depth_to_color(depth_mm: np.ndarray, min_mm: int = 20, max_mm: int = 4000) -> bytes:
-    """Convert depth frame (mm) to color-mapped JPEG bytes."""
-    norm = np.clip((depth_mm.astype(np.float32) - min_mm) / (max_mm - min_mm), 0, 1)
+def depth_to_color(depth_mm: np.ndarray, max_mm: int = 4000) -> bytes:
+    """Convert depth frame to color-mapped JPEG bytes."""
+    depth_mm = np.nan_to_num(depth_mm)
+    norm = np.clip(depth_mm.astype(np.float32) / max_mm, 0, 1)
     colored = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
     h, w = colored.shape[:2]
-    scale = 6
+    scale = 4
     big = cv2.resize(colored, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
-    # Overlay stats
-    valid = depth_mm[depth_mm > min_mm]
+    valid = depth_mm[depth_mm > 0]
     if len(valid) > 0:
         avg = valid.mean()
         cv2.putText(big, f"AVG: {avg:.0f}mm", (10, 30),
@@ -152,7 +157,7 @@ def _capture_loop():
             depth = camera.capture_depth()
             if depth is not None:
                 with frame_lock:
-                    latest_frame = depth.copy()
+                    latest_frame = depth
                 stats["frames"] += 1
         except Exception as e:
             log.error("Capture error: %s", e)
@@ -163,7 +168,7 @@ def _capture_loop():
             fps_times.pop(0)
         stats["fps"] = round(1.0 / (sum(fps_times) / len(fps_times)), 1)
 
-        time.sleep(max(0, 0.033 - elapsed))  # ~30 FPS cap
+        time.sleep(max(0, 0.033 - elapsed))
 
 
 @app.route("/")
@@ -253,15 +258,17 @@ def main():
     parser.add_argument("--mock", action="store_true", help="Use synthetic depth data")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=5000, help="Port")
+    parser.add_argument("--range", type=int, default=4000, help="Max range mm (2000 or 4000)")
     args = parser.parse_args()
 
     if args.mock:
         camera = MockCamera()
     else:
         try:
-            camera = VL53L5CXCamera()
-        except Exception:
-            log.warning("Hardware init failed, falling back to mock mode")
+            camera = ArducamToF(max_range_mm=args.range)
+        except Exception as e:
+            log.error("Hardware init failed: %s", e)
+            log.warning("Falling back to mock mode")
             camera = MockCamera()
 
     t = threading.Thread(target=_capture_loop, daemon=True)
